@@ -7,5 +7,5 @@ jobs:
   ai-pr-draft:
     uses: ./.github/workflows/ai-pr-draft.yml
     permissions:
-      contents: read
+      contents: write
       pull-requests: write
