@@ -1,0 +1,176 @@
+name: AI PR Draft Policy
+
+# Converts pull requests opened with an AI coding agent to drafts, so a human
+# reviews the change before it is marked ready for review.
+#
+# Callers should trigger on pull_request_target (types: opened, reopened) so the
+# policy always runs from the base branch and cannot be edited by the PR itself.
+
+on:
+  workflow_call:
+    inputs:
+      dry-run:
+        description: Detect and report only; do not convert the PR or comment.
+        type: boolean
+        required: false
+        default: false
+
+permissions: {}
+
+jobs:
+  enforce:
+    name: Enforce draft for AI-agent PRs
+    if: github.event.pull_request.draft == false && github.event.pull_request.state == 'open'
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Detect AI agent and convert to draft
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          DRY_RUN: ${{ inputs.dry-run }}
+        with:
+          script: |
+            const AGENT_LOGINS = {
+              'cursor[bot]': 'cursor',
+              'claude[bot]': 'claude',
+              'copilot-swe-agent[bot]': 'copilot',
+              'Copilot': 'copilot',
+              'chatgpt-codex-connector[bot]': 'codex',
+              'codex[bot]': 'codex',
+              'devin-ai-integration[bot]': 'devin',
+              'google-labs-jules[bot]': 'jules',
+              'detail-app[bot]': 'detail',
+            };
+            const BRANCH_PREFIX = /^(cursor|claude|codex|copilot|devin|jules)\//i;
+            const BODY_MARKERS = [
+              [/cursor\.com\/(agents|background-agent|automations)/i, 'cursor'],
+              [/generated with \[?claude code/i, 'claude'],
+              [/claude\.ai\/code/i, 'claude'],
+              [/chatgpt\.com\/codex/i, 'codex'],
+              [/app\.devin\.ai\/sessions/i, 'devin'],
+            ];
+            const IDENTITY_MARKERS = [
+              [/noreply@anthropic\.com/i, 'claude'],
+              [/cursoragent@cursor\.com/i, 'cursor'],
+              [/\+copilot@users\.noreply\.github\.com/i, 'copilot'],
+              [/codex@openai\.com/i, 'codex'],
+              [/devin-ai-integration/i, 'devin'],
+            ];
+            // Cursor agent workflows owned by these users follow a separate
+            // process and are exempt from this policy.
+            const CURSOR_EXEMPT_LOGINS = new Set(['alexanderogorodnikov']);
+            const COMMENT_MARKER = '<!-- ai-pr-draft-policy -->';
+
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+
+            const { repository } = await github.graphql(
+              `query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    id
+                    isDraft
+                    commits(first: 100) {
+                      nodes {
+                        commit {
+                          message
+                          authors(first: 10) { nodes { name email user { login } } }
+                        }
+                      }
+                    }
+                  }
+                }
+              }`,
+              { owner, repo, number: pr.number },
+            );
+            const node = repository.pullRequest;
+
+            const signals = [];
+            const add = (vendor, source) => signals.push({ vendor, source });
+            const author = pr.user.login;
+
+            if (AGENT_LOGINS[author]) add(AGENT_LOGINS[author], `author ${author}`);
+            const prefix = pr.head.ref.match(BRANCH_PREFIX);
+            if (prefix) add(prefix[1].toLowerCase(), `branch ${pr.head.ref}`);
+            for (const [re, vendor] of BODY_MARKERS) {
+              if (re.test(pr.body || '')) add(vendor, 'PR description footer');
+            }
+
+            const commitLogins = new Set();
+            for (const { commit } of node.commits.nodes) {
+              const identities = commit.authors.nodes.map((a) => `${a.name} <${a.email}>`);
+              const coAuthors = [...commit.message.matchAll(/^co-authored-by:\s*(.+)$/gim)].map((m) => m[1]);
+              for (const a of commit.authors.nodes) if (a.user) commitLogins.add(a.user.login);
+              for (const id of [...identities, ...coAuthors]) {
+                for (const [re, vendor] of IDENTITY_MARKERS) {
+                  if (re.test(id)) add(vendor, `commit identity ${id}`);
+                }
+              }
+            }
+
+            const vendors = [...new Set(signals.map((s) => s.vendor))];
+            const summary = core.summary.addHeading('AI PR Draft Policy', 3);
+
+            if (vendors.length === 0) {
+              await summary.addRaw('No AI agent signals detected. No action taken.').write();
+              return;
+            }
+
+            const cursorOnly = vendors.every((v) => v === 'cursor');
+            const exemptUser = [author, ...commitLogins].find((l) => CURSOR_EXEMPT_LOGINS.has(l));
+            const ownsCursorPr = CURSOR_EXEMPT_LOGINS.has(author)
+              || (author === 'cursor[bot]' && exemptUser !== undefined);
+            const sources = [...new Set(signals.map((s) => s.source))];
+            const list = sources.map((s) => `- ${s}`).join('\n');
+
+            if (cursorOnly && ownsCursorPr) {
+              await summary
+                .addRaw(`Cursor agent PR owned by exempt user ${exemptUser}. No action taken.\n\n${list}\n`)
+                .write();
+              return;
+            }
+
+            core.info(`AI agent signals (${vendors.join(', ')}):\n${list}`);
+
+            if (process.env.DRY_RUN === 'true') {
+              await summary.addRaw(`Dry run: would convert to draft.\n\n${list}\n`).write();
+              return;
+            }
+
+            if (node.isDraft) {
+              await summary.addRaw('PR is already a draft. No action taken.').write();
+              return;
+            }
+
+            await github.graphql(
+              `mutation($id: ID!) {
+                convertPullRequestToDraft(input: { pullRequestId: $id }) { pullRequest { isDraft } }
+              }`,
+              { id: node.id },
+            );
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: pr.number, per_page: 100,
+            });
+            if (!comments.some((c) => (c.body || '').includes(COMMENT_MARKER))) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: pr.number,
+                body: [
+                  COMMENT_MARKER,
+                  'This pull request was converted to a draft because it appears to have been opened with an AI coding agent.',
+                  '',
+                  'Pull requests in Infrastructure Platform and CI/CD Platform repositories that are opened with an AI agent must start as drafts. Review the changes yourself, then mark the pull request as ready for review.',
+                  '',
+                  '<details><summary>Detected signals</summary>',
+                  '',
+                  list,
+                  '',
+                  '</details>',
+                ].join('\n'),
+              });
+            }
+
+            await summary.addRaw(`Converted to draft.\n\n${list}\n`).write();
